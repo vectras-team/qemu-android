@@ -253,12 +253,18 @@ static QMPRequest *monitor_qmp_dispatcher_pop_any(void)
 
             /* On shutdown, don't take any more requests from the queue */
             if (qmp_dispatcher_co_shutdown) {
-                return NULL;
-            }
-
-            req_obj = monitor_qmp_requests_pop_any_with_lock();
-            if (req_obj) {
-                return req_obj;
+                /* A wakeup may already have queued us while we were
+                 * running. Consume it by yielding before retiring, so
+                 * no queued invocation refers to a freed coroutine. */
+                if (!qatomic_xchg(&qmp_dispatcher_co_busy, true)) {
+                    qatomic_set(&qmp_dispatcher_co, NULL);
+                    return NULL;
+                }
+            } else {
+                req_obj = monitor_qmp_requests_pop_any_with_lock();
+                if (req_obj) {
+                    return req_obj;
+                }
             }
         }
 
@@ -348,16 +354,25 @@ void coroutine_fn monitor_qmp_dispatcher_co(void *data)
 
         qmp_request_free(req_obj);
     }
-    qatomic_set(&qmp_dispatcher_co, NULL);
+    assert(qatomic_read(&qmp_dispatcher_co) == NULL);
 }
 
 void qmp_dispatcher_co_wake(void)
 {
+    Coroutine *dispatcher = NULL;
     /* Write request before reading qmp_dispatcher_co_busy.  */
     smp_mb__before_rmw();
 
-    if (!qatomic_xchg(&qmp_dispatcher_co_busy, true)) {
-        aio_co_wake(qmp_dispatcher_co);
+    WITH_QEMU_LOCK_GUARD(&monitor_lock) {
+        Coroutine *current = qatomic_read(&qmp_dispatcher_co);
+        if (current && !qatomic_xchg(&qmp_dispatcher_co_busy, true)) {
+            dispatcher = current;
+        }
+    }
+    /* busy pins the dispatcher until this wakeup is consumed. Entering a
+     * coroutine can run it synchronously, so never hold monitor_lock here. */
+    if (dispatcher) {
+        aio_co_wake(dispatcher);
     }
 }
 
@@ -368,6 +383,14 @@ static void handle_qmp_command(void *opaque, QObject *req, Error *err)
     QMPRequest *req_obj;
 
     assert(!req != !err);
+
+    WITH_QEMU_LOCK_GUARD(&monitor_lock) {
+        if (qmp_dispatcher_co_shutdown) {
+            qobject_unref(req);
+            error_free(err);
+            return;
+        }
+    }
 
     if (req && trace_event_get_state_backends(TRACE_HANDLE_QMP_COMMAND)) {
         GString *req_json = qobject_to_json(req);
